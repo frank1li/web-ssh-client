@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Web SSH Client</title>
+  <link rel="stylesheet" href="vendor/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Connection Form -->
+    <div id="connection-form" class="panel">
+      <h2>SSH Connection</h2>
+      <div class="form-group">
+        <label for="hostname">Hostname</label>
+        <input type="text" id="hostname" placeholder="e.g. 192.168.1.100" />
+      </div>
+      <div class="form-group">
+        <label for="port">Port</label>
+        <input type="number" id="port" value="22" min="1" max="65535" />
+      </div>
+      <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" placeholder="e.g. root" />
+      </div>
+      <div class="form-group">
+        <label for="auth-type">Authentication</label>
+        <select id="auth-type">
+          <option value="password">Password</option>
+          <option value="key">SSH Key</option>
+        </select>
+      </div>
+      <div class="form-group" id="password-group">
+        <label for="password">Password</label>
+        <div class="password-wrapper">
+          <input type="password" id="password" placeholder="Enter password" />
+          <button type="button" id="toggle-password" class="btn-icon" title="Toggle password visibility">👁</button>
+        </div>
+      </div>
+      <div class="form-group" id="key-group" style="display:none">
+        <label for="private-key">Private Key</label>
+        <textarea id="private-key" rows="6" placeholder="Paste private key content"></textarea>
+      </div>
+      <div class="form-group" id="passphrase-group" style="display:none">
+        <label for="passphrase">Passphrase (optional)</label>
+        <input type="password" id="passphrase" placeholder="Key passphrase" />
+      </div>
+      <button id="connect-btn" class="btn-primary">Connect</button>
+      <div id="connection-error" class="error-msg" style="display:none"></div>
+    </div>
+
+    <!-- Main Application Layout -->
+    <div id="main-layout" style="display:none">
+      <!-- Sidebar -->
+      <div id="sidebar">
+        <div class="sidebar-header">
+          <h3>Files</h3>
+          <button id="new-session-btn" class="btn-small" title="New Session">+</button>
+        </div>
+        <div id="file-tree"></div>
+        <div class="sidebar-footer">
+          <span id="status-indicator" class="status-dot disconnected"></span>
+          <span id="status-text">Disconnected</span>
+        </div>
+      </div>
+
+      <!-- Content -->
+      <div id="content">
+        <div id="tab-bar">
+          <div id="tabs"></div>
+        </div>
+        <div id="terminal-container"></div>
+        <div id="file-panel" style="display:none">
+          <div class="file-toolbar">
+            <button id="toggle-file-panel" class="btn-small">File Browser</button>
+            <span id="current-path">/</span>
+          </div>
+          <div id="file-list"></div>
+          <div id="upload-progress" style="display:none">
+            <div id="progress-bar"><div id="progress-fill"></div></div>
+            <span id="progress-text">0%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- New Session Mini Panel (floating overlay) -->
+    <div id="new-session-panel" class="mini-panel" style="display:none">
+      <div class="mini-panel-header">
+        <h3>New Session</h3>
+        <button id="mini-panel-close" class="btn-icon" title="Close">&times;</button>
+      </div>
+      <div class="mini-panel-body">
+        <div class="form-group">
+          <label for="mini-hostname">Hostname</label>
+          <input type="text" id="mini-hostname" placeholder="e.g. 192.168.1.100" />
+        </div>
+        <div class="form-row">
+          <div class="form-group" style="flex:1">
+            <label for="mini-port">Port</label>
+            <input type="number" id="mini-port" value="22" min="1" max="65535" />
+          </div>
+          <div class="form-group" style="flex:2">
+            <label for="mini-username">Username</label>
+            <input type="text" id="mini-username" placeholder="e.g. root" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="mini-auth-type">Authentication</label>
+          <select id="mini-auth-type">
+            <option value="password">Password</option>
+            <option value="key">SSH Key</option>
+          </select>
+        </div>
+        <div class="form-group" id="mini-password-group">
+          <label for="mini-password">Password</label>
+          <div class="password-wrapper">
+            <input type="password" id="mini-password" placeholder="Enter password" />
+            <button type="button" id="mini-toggle-password" class="btn-icon" title="Toggle password visibility">👁</button>
+          </div>
+        </div>
+        <div class="form-group" id="mini-key-group" style="display:none">
+          <label for="mini-private-key">Private Key</label>
+          <textarea id="mini-private-key" rows="4" placeholder="Paste private key content"></textarea>
+        </div>
+        <div class="form-group" id="mini-passphrase-group" style="display:none">
+          <label for="mini-passphrase">Passphrase (optional)</label>
+          <input type="password" id="mini-passphrase" placeholder="Key passphrase" />
+        </div>
+        <button id="mini-connect-btn" class="btn-primary">Connect</button>
+        <div id="mini-connection-error" class="error-msg" style="display:none"></div>
+      </div>
+    </div>
+    <div id="mini-panel-backdrop" class="panel-backdrop" style="display:none"></div>
+
+    <!-- Context Menu -->
+    <div id="context-menu" class="context-menu" style="display:none">
+      <div class="context-item" data-action="download">Download</div>
+      <div class="context-item" data-action="upload">Upload here</div>
+      <div class="context-separator"></div>
+      <div class="context-item" data-action="mkdir">New folder</div>
+      <div class="context-item" data-action="rename">Rename</div>
+      <div class="context-item" data-action="delete">Delete</div>
+    </div>
+  </div>
+
+  <script src="vendor/xterm/lib/xterm.js"></script>
+  <script src="vendor/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

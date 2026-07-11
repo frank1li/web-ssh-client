@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm search *)",
+      "Skill(openspec-apply-change)",
+      "Skill(openspec-apply-change:*)",
+      "Bash(node server/index.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/vendor/xterm/lib/xterm.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/vendor/xterm/css/xterm.css)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/vendor/xterm-addon-fit/lib/xterm-addon-fit.js)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/)",
+      "Bash(kill %1)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /F /PID 20608)",
+      "Bash(taskkill //F //PID 20608)",
+      "Bash(curl -s -o /dev/null -w \"favicon.ico: %{http_code}\\\\n\" http://localhost:3000/favicon.ico)",
+      "Bash(curl -s -o /dev/null -w \".well-known: %{http_code}\\\\n\" http://localhost:3000/.well-known/appspecific/com.chrome.devtools.json)",
+      "Bash(curl -s http://localhost:3000/api/health)",
+      "Bash(wait)",
+      "Bash(timeout 3 npm start)",
+      "Bash(taskkill //F //IM node.exe)",
+      "Bash(node -e \"require\\('./client/public/app.js'\\)\")",
+      "Bash(node --check client/public/app.js)",
+      "Bash(node --check server/index.js)",
+      "Bash(node --check server/routes/api.js)",
+      "Bash(node --check server/services/sftpService.js)",
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)"
+    ]
+  }
+}

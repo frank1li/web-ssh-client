@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
+coverage/
+.vscode/
+.idea/
+*.key
+*.pem
+*.cert
+.DS_Store
+Thumbs.db
