@@ -12,3 +12,9 @@ coverage/
 *.cert
 .DS_Store
 Thumbs.db
+
+# Mock SSH server
+mock-server/host_key
+mock-server/config.json
+mock-server/__pycache__/
+
