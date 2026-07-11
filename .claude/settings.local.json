@@ -31,7 +31,12 @@
       "Bash(timeout 5 python mock_server.py --port 2222)",
       "Bash(python -c ' *)",
       "Bash(timeout 3 python mock_server.py --port 2222)",
-      "Bash(echo \"Exit: $?\")"
+      "Bash(echo \"Exit: $?\")",
+      "Bash(taskkill //f //im python.exe)",
+      "Bash(rm -rf g:/web-ssh-client/mock-server/mock-root)",
+      "Bash(mkdir -p g:/web-ssh-client/mock-server/mock-root)",
+      "Bash(pwd -W)",
+      "Bash(python mock_server.py --root-dir \"$\\(pwd -W\\)/mock-root\")"
     ]
   }
 }

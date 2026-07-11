@@ -32,6 +32,8 @@ Options:
   -u, --username USER Authentication username (default: mock)
   --password PASS     Authentication password (default: mock)
   --host-key PATH     Path to RSA host key file (default: ./host_key)
+  --root-dir PATH     Path to real filesystem root for SFTP (default: ./mock-root)
+  --log-file PATH     Path to log file (default: terminal stderr only)
   -c, --config PATH   Path to JSON config file (default: ./config.json)
 ```
 
@@ -59,7 +61,7 @@ On first run, a 2048-bit RSA host key is automatically generated and cached in `
 
 ## Features
 
-### Shell (12 built-in commands)
+### Shell (14 built-in commands)
 
 | Command | Description |
 |---------|-------------|
@@ -75,6 +77,8 @@ On first run, a 2048-bit RSA host key is automatically generated and cached in `
 | `clear` | Clear terminal |
 | `exit` | Disconnect |
 | `help` | List commands |
+| `history` | Show command history |
+| `touch` | Create empty file or update file timestamp |
 
 ### SFTP
 

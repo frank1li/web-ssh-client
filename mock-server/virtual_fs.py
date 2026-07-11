@@ -465,3 +465,203 @@ class VirtualFilesystem:
         if not path.startswith("/"):
             path = os.path.join(cwd, path)
         return os.path.normpath(path).replace("\\", "/")
+
+
+class HybridFilesystem:
+    """Hybrid filesystem backed by VirtualFilesystem (read-only overlay) + real disk.
+
+    Lookup order: real FS first, then virtual FS fallback.
+    Write operations always go to the real FS.
+    Path traversal outside root_dir is prevented.
+    """
+
+    def __init__(self, virtual_fs, root_dir):
+        self.virtual = virtual_fs
+        self.root_dir = os.path.abspath(root_dir)
+        os.makedirs(self.root_dir, exist_ok=True)
+
+    # ── Path mapping ────────────────────────────────────────────────────
+
+    def _real_path(self, path):
+        """Convert a virtual path (e.g. /home/user/file) to a real fs path."""
+        path = path.replace("\\", "/")
+        if path == "/":
+            return self.root_dir
+        relative = path.lstrip("/")
+        return os.path.join(self.root_dir, relative.replace("/", os.sep))
+
+    def _safe_real_path(self, path):
+        """Resolve the real path and verify it stays within root_dir. None if unsafe."""
+        real = os.path.realpath(self._real_path(path))
+        root = os.path.realpath(self.root_dir)
+        if not real.startswith(root + os.sep) and real != root:
+            return None
+        return real
+
+    # ── Queries ─────────────────────────────────────────────────────────
+
+    def exists(self, path):
+        if self._on_disk(path):
+            return True
+        return self.virtual.exists(path)
+
+    def is_dir(self, path):
+        if self._is_dir_on_disk(path):
+            return True
+        return self.virtual.is_dir(path)
+
+    def is_file(self, path):
+        if self._is_file_on_disk(path):
+            return True
+        return self.virtual.is_file(path)
+
+    def normalize_path(self, path, cwd="/"):
+        return self.virtual.normalize_path(path, cwd)
+
+    def readdir(self, path):
+        """Merge virtual and real directory listings. Real FS shadows virtual."""
+        # . and .. from virtual
+        result = [
+            (".", self.virtual.stat("/")),
+            ("..", {"st_mode": stat.S_IFDIR | 0o755, "st_size": 4096,
+                    "st_uid": 0, "st_gid": 0,
+                    "st_mtime": int(time.time()), "st_atime": int(time.time())}),
+        ]
+        # Virtual FS entries
+        virtual_entries = self.virtual.readdir(path)
+        if virtual_entries is None and not self._is_dir_on_disk(path):
+            return None
+        virtual_map = {}
+        if virtual_entries:
+            for name, attr in virtual_entries:
+                if name not in (".", ".."):
+                    virtual_map[name] = attr
+        # Real FS entries
+        real = self._safe_real_path(path)
+        real_map = {}
+        if real is not None and os.path.isdir(real):
+            for name in os.listdir(real):
+                full = os.path.join(real, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                real_map[name] = {
+                    "st_mode": st.st_mode,
+                    "st_size": st.st_size,
+                    "st_uid": st.st_uid,
+                    "st_gid": st.st_gid,
+                    "st_mtime": st.st_mtime,
+                    "st_atime": st.st_atime,
+                }
+        # Merge: real FS shadows virtual
+        merged = {}
+        merged.update(virtual_map)
+        merged.update(real_map)
+        for name in sorted(merged):
+            result.append((name, merged[name]))
+        return result
+
+    def stat(self, path):
+        attr = self._stat_on_disk(path)
+        if attr is not None:
+            return attr
+        return self.virtual.stat(path)
+
+    def read(self, path):
+        real = self._safe_real_path(path)
+        if real is not None and os.path.isfile(real):
+            try:
+                with open(real, "rb") as f:
+                    return f.read()
+            except OSError:
+                return None
+        return self.virtual.read(path)
+
+    def write(self, path, data):
+        real = self._real_path(path)
+        parent = os.path.dirname(real)
+        try:
+            os.makedirs(parent, exist_ok=True)
+            with open(real, "wb") as f:
+                f.write(data if isinstance(data, bytes) else data.encode())
+            return True
+        except OSError:
+            return False
+
+    def mkdir(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        try:
+            os.makedirs(real, exist_ok=False)
+            return True
+        except OSError:
+            return False
+
+    def rmdir(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        try:
+            os.rmdir(real)
+            return True
+        except OSError:
+            return False
+
+    def unlink(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        try:
+            os.unlink(real)
+            return True
+        except OSError:
+            return False
+
+    def rename(self, old_path, new_path):
+        old = self._safe_real_path(old_path)
+        new_real = self._real_path(new_path)
+        if old is None:
+            return False
+        new_parent = os.path.dirname(new_real)
+        try:
+            os.makedirs(new_parent, exist_ok=True)
+            os.replace(old, new_real)
+            return True
+        except OSError:
+            return False
+
+    # ── Internal helpers ────────────────────────────────────────────────
+
+    def _on_disk(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        return os.path.exists(real)
+
+    def _is_dir_on_disk(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        return os.path.isdir(real)
+
+    def _is_file_on_disk(self, path):
+        real = self._safe_real_path(path)
+        if real is None:
+            return False
+        return os.path.isfile(real)
+
+    def _stat_on_disk(self, path):
+        real = self._safe_real_path(path)
+        if real is None or not os.path.exists(real):
+            return None
+        st = os.stat(real)
+        return {
+            "st_mode": st.st_mode,
+            "st_size": st.st_size,
+            "st_uid": st.st_uid,
+            "st_gid": st.st_gid,
+            "st_mtime": st.st_mtime,
+            "st_atime": st.st_atime,
+        }

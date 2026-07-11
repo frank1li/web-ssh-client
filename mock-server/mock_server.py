@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import signal
 import socket
@@ -21,7 +22,7 @@ import time
 
 from paramiko import RSAKey, SSHException
 
-from virtual_fs import VirtualFilesystem
+from virtual_fs import VirtualFilesystem, HybridFilesystem
 from mock_handler import handle_connection
 
 # Default paths relative to this script's directory
@@ -34,6 +35,8 @@ _DEFAULT_CONFIG = {
     "port": 2222,
     "auth": {"username": "mock", "password": "mock"},
     "host_key": _DEFAULT_HOST_KEY_PATH,
+    "root_dir": os.path.join(_HERE, "mock-root"),
+    "log_file": None,
 }
 
 
@@ -55,7 +58,7 @@ def load_config(cli_args):
                 file_config = json.load(f)
             config.update(file_config)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: could not load config file '{config_path}': {e}")
+            logging.warning("Could not load config file '%s': %s", config_path, e)
 
     # CLI overrides
     if cli_args.host is not None:
@@ -68,8 +71,51 @@ def load_config(cli_args):
         config["auth"]["password"] = cli_args.password
     if cli_args.host_key is not None:
         config["host_key"] = cli_args.host_key
+    if cli_args.root_dir is not None:
+        config["root_dir"] = cli_args.root_dir
+    if cli_args.log_file is not None:
+        config["log_file"] = os.path.abspath(cli_args.log_file)
 
     return config
+
+
+# ── Logging ────────────────────────────────────────────────────────────────
+
+
+def logging_setup(config):
+    """Configure logging: terminal output (INFO+) and optional file (DEBUG+).
+
+    Call once at startup before any log messages.
+    """
+    log_level = getattr(logging, config.get("log_level", "DEBUG"))
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Root logger
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
+    # Remove any pre-existing handlers (in case of re-init)
+    root.handlers.clear()
+
+    # Always log to stderr at INFO level
+    stream = logging.StreamHandler(sys.stderr)
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+
+    # Optional log file at DEBUG level
+    log_file = config.get("log_file")
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        except OSError:
+            pass
+        fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+        logging.info("Logging to file: %s", log_file)
 
 
 # ── Host key management ───────────────────────────────────────────────────
@@ -85,19 +131,19 @@ def load_or_generate_host_key(key_path):
     if os.path.exists(key_path):
         try:
             key = RSAKey.from_private_key_file(key_path)
-            print(f"Loaded existing host key from {key_path}")
+            logging.info("Loaded existing host key from %s", key_path)
             return key
         except SSHException as e:
-            print(f"Warning: could not load host key '{key_path}': {e}")
+            logging.warning("Could not load host key '%s': %s", key_path, e)
 
     # Generate a new key
-    print(f"Generating new RSA host key (2048-bit)...")
+    logging.info("Generating new RSA host key (2048-bit)...")
     key = RSAKey.generate(bits=2048)
     try:
         key.write_private_key_file(key_path)
-        print(f"Saved host key to {key_path}")
+        logging.info("Saved host key to %s", key_path)
     except OSError as e:
-        print(f"Warning: could not save host key: {e}")
+        logging.warning("Could not save host key: %s", e)
 
     return key
 
@@ -113,6 +159,7 @@ class MockServer:
         self._shutdown_event = threading.Event()
         self._server_socket = None
         self._threads = []
+        self._fs = None
 
     def run(self):
         """Start the TCP listener and accept connections in a loop."""
@@ -127,18 +174,19 @@ class MockServer:
             self._server_socket.bind((host, port))
             self._server_socket.listen(100)
         except OSError as e:
-            print(f"Error: could not bind to {host}:{port} — {e}")
+            logging.error("Could not bind to %s:%s — %s", host, port, e)
             sys.exit(1)
 
-        fs = VirtualFilesystem()
+        fs = HybridFilesystem(VirtualFilesystem(), self.config["root_dir"])
+        self._fs = fs
         self.config["host_key_obj"] = load_or_generate_host_key(self.config["host_key"])
 
         auth = self.config["auth"]
-        print(f"Mock SSH Server started on {host}:{port}")
-        print(f"  Credentials: {auth['username']} / {auth['password']}")
-        print(f"  Host key: {os.path.abspath(self.config['host_key'])}")
-        print("Press Ctrl+C to stop.")
-        print()
+        logging.info("Mock SSH Server started on %s:%s", host, port)
+        logging.info("  Credentials: %s / %s", auth['username'], auth['password'])
+        logging.info("  Host key: %s", os.path.abspath(self.config['host_key']))
+        logging.info("  Root dir: %s", os.path.abspath(self.config['root_dir']))
+        logging.info("Press Ctrl+C to stop.")
 
         while not self._shutdown_event.is_set():
             try:
@@ -148,7 +196,7 @@ class MockServer:
             except OSError:
                 break
 
-            print(f"Connection from {addr[0]}:{addr[1]}")
+            logging.info("Connection from %s:%s", addr[0], addr[1])
             t = threading.Thread(
                 target=handle_connection,
                 args=(client_sock, addr, fs, self.config),
@@ -161,7 +209,7 @@ class MockServer:
 
     def stop(self):
         """Signal graceful shutdown."""
-        print("\nShutting down...")
+        logging.info("Shutting down...")
         self._shutdown_event.set()
         if self._server_socket:
             try:
@@ -171,10 +219,10 @@ class MockServer:
 
     def _cleanup(self):
         """Wait for active threads to finish."""
-        print(f"Waiting for {len(self._threads)} active connections to close...")
+        logging.info("Waiting for %s active connections to close...", len(self._threads))
         for t in self._threads:
             t.join(timeout=5)
-        print("Goodbye.")
+        logging.info("Goodbye.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -215,6 +263,14 @@ def build_parser():
         help="Path to RSA host key file (default: ./host_key)",
     )
     parser.add_argument(
+        "--root-dir",
+        help="Path to real filesystem root directory for SFTP (default: ./mock-root)",
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Path to log file (default: stderr only)",
+    )
+    parser.add_argument(
         "-c", "--config",
         help=f"Path to JSON config file (default: {_DEFAULT_CONFIG_PATH})",
     )
@@ -226,6 +282,8 @@ def main():
     args = parser.parse_args()
     config = load_config(args)
 
+    logging_setup(config)
+    logging.info("Starting Mock SSH Server...")
     server = MockServer(config)
 
     # Register signal handlers for graceful shutdown

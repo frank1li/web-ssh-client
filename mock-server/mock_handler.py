@@ -1,5 +1,6 @@
 """SSH server interface, interactive shell, and SFTP handler for the mock server."""
 
+import logging
 import os
 import stat
 import time
@@ -14,6 +15,8 @@ from paramiko import (
     SFTPHandle, SFTPAttributes, SFTPServerInterface,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ── SSH Server Interface ──────────────────────────────────────────────────
 
@@ -25,7 +28,8 @@ class MockSSHServer(paramiko.ServerInterface):
         self.allowed_username = allowed_username
         self.allowed_password = allowed_password
         self.event = threading.Event()
-        self.subsystem = None
+        self._subsystem_types = {}
+        self._lock = threading.Lock()
 
     def check_auth_password(self, username, password):
         if username == self.allowed_username and password == self.allowed_password:
@@ -41,7 +45,8 @@ class MockSSHServer(paramiko.ServerInterface):
         return OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_channel_shell_request(self, channel):
-        self.subsystem = "shell"
+        with self._lock:
+            self._subsystem_types[channel.chanid] = "shell"
         self.event.set()
         return True
 
@@ -58,12 +63,18 @@ class MockSSHServer(paramiko.ServerInterface):
         return True
 
     def check_channel_subsystem_request(self, channel, name):
-        self.subsystem = name
+        with self._lock:
+            self._subsystem_types[channel.chanid] = name
         self.event.set()
         return True
 
     def check_channel_window_change_request(self, channel, width, height, pw, ph):
         return True
+
+    def pop_channel_type(self, channel):
+        """Get and remove the stored subsystem/shell type for a channel."""
+        with self._lock:
+            return self._subsystem_types.pop(channel.chanid, None)
 
     def _exec_command(self, channel, command):
         """Execute a command (for exec channel requests, currently limited)."""
@@ -122,7 +133,7 @@ class ShellHandler:
 
     _COMMANDS = (
         "ls  cd  pwd  cat  echo  whoami  id  "
-        "uname  date  clear  exit  help"
+        "uname  date  clear  exit  help  history  touch"
     )
 
     def __init__(self, channel, fs, username="mock"):
@@ -132,6 +143,11 @@ class ShellHandler:
         self.hostname = "mock-server"
         self.cwd = "/home/user"
         self._buffer = ""
+        self._history = []
+        self._history_index = -1
+        self._saved_line = ""
+        self._escape_buf = None
+        self._load_history()
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -147,6 +163,25 @@ class ShellHandler:
                 break
 
             for byte in data:
+                # ── Escape sequence (arrow keys) ──────────────────────
+                if self._escape_buf is not None:
+                    self._escape_buf += bytes([byte])
+                    if len(self._escape_buf) >= 3:
+                        if self._escape_buf == b"\x1b[A":
+                            self._history_up()
+                        elif self._escape_buf == b"\x1b[B":
+                            self._history_down()
+                        self._escape_buf = None
+                    elif len(self._escape_buf) == 2 and self._escape_buf[1:2] != b"[":
+                        # Not a CSI sequence, discard
+                        self._escape_buf = None
+                    continue
+
+                if byte == 0x1b:  # Start of escape sequence
+                    self._escape_buf = b"\x1b"
+                    continue
+
+                # ── Normal byte processing ────────────────────────────
                 char = bytes([byte])
 
                 if char in (b"\r", b"\n"):  # Enter
@@ -158,15 +193,17 @@ class ShellHandler:
                             self._execute(cmd)
                         except SystemExit:
                             return
+                        self._add_history(cmd)
                     self.channel.send(self._prompt())
 
                 elif char == b"\x7f":  # Backspace
                     if self._buffer:
                         self._buffer = self._buffer[:-1]
-                        self.channel.send(b"\b \b")  # Erase on terminal
+                        self.channel.send(b"\b \b")
 
                 elif char == b"\x03":  # Ctrl+C
                     self._buffer = ""
+                    self._history_index = -1
                     self.channel.send(b"^C\r\n")
                     self.channel.send(self._prompt())
 
@@ -174,6 +211,9 @@ class ShellHandler:
                     if not self._buffer:
                         self.channel.send(b"\r\n")
                         return
+
+                elif char == b"\t":  # Tab completion
+                    self._tab_complete()
 
                 elif 0x20 <= byte <= 0x7e:  # Printable ASCII
                     self._buffer += char.decode()
@@ -192,6 +232,158 @@ class ShellHandler:
     def _writeline(self, text=""):
         """Append CRLF and send *text* to the channel."""
         self.channel.send(text + "\r\n")
+
+    # ── Tab completion ──────────────────────────────────────────────────
+
+    def _show_completions(self, matches):
+        """Print completion candidates and re-display the prompt + buffer."""
+        if not matches:
+            return
+        self.channel.send(b"\r\n")
+        # Columnated output
+        cols = 4
+        col_w = max(len(m) for m in matches) + 2
+        for i, m in enumerate(matches):
+            self.channel.send(m.ljust(col_w).encode())
+            if (i + 1) % cols == 0:
+                self.channel.send(b"\r\n")
+        self.channel.send(b"\r\n")
+        self.channel.send(self._prompt().encode())
+        self.channel.send(self._buffer.encode())
+
+    def _tab_complete(self):
+        """Handle Tab: try to complete the current buffer word."""
+        if not self._buffer:
+            self._show_completions(self._COMMANDS.split())
+            return
+
+        parts = self._buffer.split()
+        starting_new_word = self._buffer.endswith(" ")
+
+        # ── Command completion (first word) ──────────────────────────
+        if len(parts) == 1 and not starting_new_word:
+            prefix = parts[0].lower()
+            matches = [c for c in self._COMMANDS.split() if c.startswith(prefix)]
+            if len(matches) == 1 and matches[0] != prefix:
+                suffix = matches[0][len(prefix):] + " "
+                self._buffer += suffix
+                self.channel.send(suffix.encode())
+            elif len(matches) > 1:
+                self._show_completions(matches)
+            return
+
+        # ── Path completion (arguments) ──────────────────────────────
+        # Determine directory and prefix
+        if starting_new_word:
+            dir_abs = self.cwd
+            raw_prefix = ""
+        else:
+            word = parts[-1]
+            if "/" in word:
+                dir_path = word[:word.rfind("/")] or "/"
+                raw_prefix = word[word.rfind("/") + 1:]
+            else:
+                dir_path = self.cwd
+                raw_prefix = word
+            dir_abs = self.fs.normalize_path(dir_path, self.cwd)
+
+        entries = self.fs.readdir(dir_abs)
+        if entries is None:
+            return
+
+        matches = []
+        for name, attr in entries:
+            if name in (".", ".."):
+                continue
+            if name.startswith(raw_prefix):
+                display = name
+                if stat.S_ISDIR(attr["st_mode"]):
+                    display += "/"
+                matches.append(display)
+        matches.sort()
+
+        if len(matches) == 1:
+            suffix = matches[0][len(raw_prefix):]
+            self._buffer += suffix
+            self.channel.send(suffix.encode())
+        elif len(matches) > 1:
+            common = os.path.commonprefix(matches)
+            if len(common) > len(raw_prefix):
+                suffix = common[len(raw_prefix):]
+                self._buffer += suffix
+                self.channel.send(suffix.encode())
+            else:
+                self._show_completions(matches)
+
+    # ── Command history ─────────────────────────────────────────────────
+
+    def _add_history(self, cmd):
+        """Add a command to history and persist."""
+        if not cmd or (self._history and self._history[-1] == cmd):
+            return  # Don't dup consecutive identical commands
+        self._history.append(cmd)
+        self._history_index = -1
+        self._save_history()
+
+    def _load_history(self):
+        """Load history from ~/.mock_ssh_history."""
+        path = os.path.join(os.path.expanduser("~"), ".mock_ssh_history")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._history = [line.rstrip("\n") for line in f if line.strip()]
+        except (FileNotFoundError, OSError):
+            self._history = []
+        self._history_index = -1
+
+    def _save_history(self):
+        """Append the latest command to the history file (max 1000 entries)."""
+        path = os.path.join(os.path.expanduser("~"), ".mock_ssh_history")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(self._history[-1] + "\n")
+            # Trim to last 1000 lines
+            if len(self._history) > 1000:
+                self._history = self._history[-1000:]
+                with open(path, "w", encoding="utf-8") as f:
+                    for cmd in self._history:
+                        f.write(cmd + "\n")
+        except OSError:
+            pass
+
+    def _history_up(self):
+        """Navigate backward in history (Up arrow)."""
+        if not self._history:
+            return
+        if self._history_index == -1:
+            # First press — save current line
+            self._saved_line = self._buffer
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        else:
+            return  # Already at oldest entry
+        self._replace_buffer(self._history[self._history_index])
+
+    def _history_down(self):
+        """Navigate forward in history (Down arrow)."""
+        if self._history_index == -1:
+            return  # Already at the bottom (new input)
+        self._history_index += 1
+        if self._history_index >= len(self._history):
+            self._history_index = -1
+            self._replace_buffer(self._saved_line)
+            self._saved_line = ""
+        else:
+            self._replace_buffer(self._history[self._history_index])
+
+    def _replace_buffer(self, text):
+        """Replace the current line on the terminal and update _buffer."""
+        # Erase current line
+        cur_len = len(self._buffer)
+        if cur_len > 0:
+            self.channel.send(b"\b \b" * cur_len)
+        self._buffer = text
+        self.channel.send(text.encode())
 
     # ── Command dispatch ────────────────────────────────────────────────
 
@@ -213,6 +405,8 @@ class ShellHandler:
             "clear": self._cmd_clear,
             "exit": self._cmd_exit,
             "help": self._cmd_help,
+            "history": self._cmd_history,
+            "touch": self._cmd_touch,
         }.get(cmd)
 
         if handler:
@@ -284,10 +478,9 @@ class ShellHandler:
         else:
             target = self.fs.normalize_path(args[0], self.cwd)
 
-        node = self.fs._resolve(target)
-        if node is None:
+        if not self.fs.exists(target):
             self._writeline(f"cd: {args[0]}: No such file or directory")
-        elif not node.is_dir:
+        elif not self.fs.is_dir(target):
             self._writeline(f"cd: {args[0]}: Not a directory")
         else:
             self.cwd = target
@@ -302,8 +495,7 @@ class ShellHandler:
         path = self.fs.normalize_path(args[0], self.cwd)
         content = self.fs.read(path)
         if content is None:
-            node = self.fs._resolve(path)
-            if node and node.is_dir:
+            if self.fs.is_dir(path):
                 self._writeline(f"cat: {args[0]}: Is a directory")
             else:
                 self._writeline(f"cat: {args[0]}: No such file or directory")
@@ -342,6 +534,24 @@ class ShellHandler:
             time.strftime("%a %b %d %H:%M:%S %Z %Y")
         )
 
+    def _cmd_history(self, args):
+        """Show command history with line numbers."""
+        if not self._history:
+            self._writeline("  (history empty)")
+            return
+        for i, cmd in enumerate(self._history, 1):
+            self._writeline(f"  {i:4d}  {cmd}")
+
+    def _cmd_touch(self, args):
+        if not args:
+            self._writeline("touch: missing file operand")
+            return
+        path = self.fs.normalize_path(args[0], self.cwd)
+        if self.fs.exists(path):
+            self.fs.write(path, self.fs.read(path) or b"")
+        else:
+            self.fs.write(path, b"")
+
     def _cmd_clear(self, args):
         self.channel.send("\033[2J\033[H")
 
@@ -364,15 +574,17 @@ class ShellHandler:
             "  date     Show the current date and time\r\n"
             "  clear    Clear the terminal screen\r\n"
             "  exit     Disconnect from this session\r\n"
-            "  help     Show this help message"
+            "  help     Show this help message\r\n"
+            "  history  Show command history\r\n"
+            "  touch    Create an empty file or update file timestamp"
         )
 
 
 # ── SFTP Handler ──────────────────────────────────────────────────────────
 
 
-class MockSFTPHandle(SFTPHandle):
-    """A file handle for a virtual file, used for read/write/close."""
+class MockSFTPHandle_VirtualNode(SFTPHandle):
+    """A file handle backed by an in-memory VirtualNode (read-only fallback)."""
 
     def __init__(self, path, flags, node):
         super().__init__(flags=flags)
@@ -390,7 +602,6 @@ class MockSFTPHandle(SFTPHandle):
             return SFTP_OK
         content = self.node.content
         if offset + len(data) > len(content):
-            # Extend file content with zeros if writing beyond current EOF
             new_content = bytearray(content)
             if offset > len(new_content):
                 new_content.extend(b"\x00" * (offset - len(new_content)))
@@ -407,8 +618,40 @@ class MockSFTPHandle(SFTPHandle):
         return SFTP_OK
 
 
+class MockSFTPHandle_File(SFTPHandle):
+    """A file handle backed by a real file on disk (read/write)."""
+
+    def __init__(self, fh, flags):
+        super().__init__(flags=flags)
+        self.fh = fh
+
+    def read(self, offset, length):
+        try:
+            self.fh.seek(offset)
+            return self.fh.read(length)
+        except OSError:
+            return b""
+
+    def write(self, offset, data):
+        try:
+            self.fh.seek(offset)
+            self.fh.write(data)
+            logger.debug("[file_handle.write] offset=%s len=%s", offset, len(data))
+            return SFTP_OK
+        except OSError:
+            return paramiko.SFTP_FAILURE
+
+    def close(self):
+        try:
+            self.fh.close()
+            logger.debug("[file_handle.close] closed")
+            return SFTP_OK
+        except OSError:
+            return paramiko.SFTP_FAILURE
+
+
 class MockSFTPServer(SFTPServerInterface):
-    """SFTP server interface backed by the virtual filesystem."""
+    """SFTP server interface backed by the hybrid filesystem."""
 
     def __init__(self, server, fs=None, *args, **kwargs):
         """server is the MockSSHServer instance (passed by SFTPServer)."""
@@ -453,20 +696,50 @@ class MockSFTPServer(SFTPServerInterface):
         return self.stat(path)
 
     def open(self, path, flags, attr):
-        node = self.fs._resolve(path)
-        if node is None:
-            # File doesn't exist — create if O_CREAT is set
-            if flags & os.O_CREAT:
-                self.fs.write(path, b"")
-                node = self.fs._resolve(path)
-                if node is None:
-                    return paramiko.SFTP_FAILURE
-            else:
+        # Get the real filesystem path if possible
+        real = None
+        if hasattr(self.fs, '_safe_real_path'):
+            real = self.fs._safe_real_path(path)
+        logger.debug("[open] path=%s flags=%o real=%s", path, flags, real)
+        logger.debug("[open] O_CREAT=%s O_WRONLY=%s O_RDWR=%s",
+                     bool(flags & os.O_CREAT), bool(flags & os.O_WRONLY), bool(flags & os.O_RDWR))
+
+        # Writing / creating — always use real FS
+        if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR):
+            write_ok = self.fs.write(path, b"")
+            logger.debug("[open] write(b'') -> %s", write_ok)
+            if real:
+                file_exists = os.path.isfile(real)
+                logger.debug("[open] real=%s file_exists=%s", real, file_exists)
+                if file_exists:
+                    try:
+                        fh = open(real, "r+b")
+                        logger.debug("[open] opened file handle: %s", fh)
+                        return MockSFTPHandle_File(fh, flags)
+                    except OSError as e:
+                        logger.debug("[open] open error: %s", e)
+                        return paramiko.SFTP_FAILURE
+            logger.debug("[open] falling through to virtual FS")
+            return paramiko.SFTP_FAILURE
+
+        # Reading — try real FS first
+        if real and os.path.isfile(real):
+            try:
+                fh = open(real, "rb")
+                logger.debug("[open] reading from real FS: %s", real)
+                return MockSFTPHandle_File(fh, flags)
+            except OSError:
                 return paramiko.SFTP_NO_SUCH_FILE
+
+        # Fall back to virtual FS (read-only static content)
+        logger.debug("[open] fallback to virtual FS for: %s", path)
+        node = self.fs.virtual._resolve(path)
+        if node is None:
+            return paramiko.SFTP_NO_SUCH_FILE
         if node.is_dir:
             return paramiko.SFTP_FAILURE
 
-        return MockSFTPHandle(path, flags, node)
+        return MockSFTPHandle_VirtualNode(path, flags, node)
 
     def mkdir(self, path, attr):
         try:
@@ -506,11 +779,18 @@ class MockSFTPServer(SFTPServerInterface):
 # ── Connection dispatcher ──────────────────────────────────────────────────
 
 
-def handle_connection(client_sock, addr, fs, config):
-    """Handle a single SSH client connection.
+def _run_sftp(channel, server, fs):
+    """Run an SFTP server on the given channel."""
+    sftp = paramiko.SFTPServer(channel, "sftp", server, MockSFTPServer, fs=fs)
+    sftp.start()
+    sftp.join()
 
-    Runs the transport handshake → auth → channel dispatch in a blocking
-    fashion (intended to be called from a thread).
+
+def handle_connection(client_sock, addr, fs, config):
+    """Handle a single SSH client connection with multi-channel support.
+
+    Shell and SFTP channels are accepted concurrently, each running in its
+    own daemon thread. The loop exits when all channels close.
     """
     transport = paramiko.Transport(client_sock)
     transport.add_server_key(config["host_key_obj"])
@@ -523,25 +803,44 @@ def handle_connection(client_sock, addr, fs, config):
         transport.close()
         return
 
-    # Accept a channel (first channel opened by the client)
-    channel = transport.accept(30)
-    if channel is None:
-        transport.close()
-        return
+    active_threads = []
 
-    # Wait for the shell/subsystem request callback to fire
-    server.event.wait(10)
+    while True:
+        channel = transport.accept(2)
+        if channel is not None:
+            # Determine what type of channel this is (shell / sftp / exec)
+            chan_type = server.pop_channel_type(channel)
+            if chan_type is None:
+                # Callback hasn't fired yet — wait for it
+                server.event.clear()
+                server.event.wait(10)
+                server.event.clear()
+                chan_type = server.pop_channel_type(channel)
 
-    try:
-        if server.subsystem == "shell":
-            ShellHandler(channel, fs, username=config["auth"]["username"]).start()
-        elif server.subsystem == "sftp":
-            sftp = paramiko.SFTPServer(channel, "sftp", server, MockSFTPServer, fs=fs)
-            sftp.start()
-            sftp.join()
+            logger.debug("[handle_connection] accepted channel %s: type=%s", channel.chanid, chan_type)
+
+            if chan_type == "shell":
+                t = threading.Thread(
+                    target=ShellHandler(channel, fs,
+                                        username=config["auth"]["username"]).start,
+                    daemon=True,
+                )
+                t.start()
+                active_threads.append(t)
+            elif chan_type == "sftp":
+                t = threading.Thread(
+                    target=_run_sftp,
+                    args=(channel, server, fs),
+                    daemon=True,
+                )
+                t.start()
+                active_threads.append(t)
+            else:
+                channel.close()
         else:
-            channel.close()
-    except (EOFError, OSError, paramiko.SSHException):
-        pass
-    finally:
-        transport.close()
+            # Timeout — prune dead threads and exit if all done
+            active_threads = [t for t in active_threads if t.is_alive()]
+            if not active_threads:
+                break
+
+    transport.close()
