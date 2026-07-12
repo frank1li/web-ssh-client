@@ -1,9 +1,16 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
 const logger = require('../utils/logger');
 const sessionManager = require('../models/sessionManager');
 const sshHandler = require('../services/sshHandler');
 const sftpService = require('../services/sftpService');
+
+// Multer config: memory storage, 1GB file size limit
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024 * 1024 }
+});
 
 // Health check
 router.get('/health', (req, res) => {
@@ -104,7 +111,7 @@ router.get('/sessions/:id/files', async (req, res) => {
 });
 
 // POST /api/sessions/:id/upload - Upload file
-router.post('/sessions/:id/upload', async (req, res) => {
+router.post('/sessions/:id/upload', upload.single('file'), async (req, res) => {
   try {
     const rawSession = sessionManager.getRawSession(req.params.id);
     if (!rawSession) return res.status(404).json({ error: 'Session not found' });
@@ -112,12 +119,24 @@ router.post('/sessions/:id/upload', async (req, res) => {
       return res.status(400).json({ error: 'Session not connected' });
     }
 
-    const { localPath, remotePath } = req.body;
-    if (!localPath || !remotePath) {
-      return res.status(400).json({ error: 'localPath and remotePath required' });
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided' });
     }
 
-    await sftpService.uploadFile(req.params.id, rawSession.conn, localPath, remotePath);
+    const remotePath = req.body.remotePath;
+    if (!remotePath) {
+      return res.status(400).json({ error: 'remotePath required' });
+    }
+
+    await sftpService.uploadFromBuffer(
+      req.params.id,
+      rawSession.conn,
+      req.file.buffer,
+      remotePath,
+      (written, total) => {
+        logger.sshDebug(req.params.id, 'Upload progress', { written, total });
+      }
+    );
     res.json({ message: 'Upload complete', remotePath });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -133,13 +152,25 @@ router.post('/sessions/:id/download', async (req, res) => {
       return res.status(400).json({ error: 'Session not connected' });
     }
 
-    const { remotePath, localPath } = req.body;
-    if (!remotePath || !localPath) {
-      return res.status(400).json({ error: 'remotePath and localPath required' });
+    const { remotePath } = req.body;
+    if (!remotePath) {
+      return res.status(400).json({ error: 'remotePath required' });
     }
 
-    await sftpService.downloadFile(req.params.id, rawSession.conn, remotePath, localPath);
-    res.json({ message: 'Download complete', localPath });
+    const filename = remotePath.split('/').pop() || 'download';
+    const { stream, sftp, stat } = await sftpService.createReadStream(req.params.id, rawSession.conn, remotePath);
+
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', stat.size);
+
+    stream.pipe(res);
+    stream.on('error', (err) => {
+      logger.sshError(req.params.id, 'Download stream error', { error: err.message });
+      sftp.end();
+      if (!res.headersSent) res.status(502).json({ error: err.message });
+    });
+    stream.on('end', () => sftp.end());
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -197,6 +228,25 @@ router.post('/sessions/:id/rename', async (req, res) => {
 
     await sftpService.rename(req.params.id, rawSession.conn, oldPath, newPath);
     res.json({ message: 'Rename complete', oldPath, newPath });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// DELETE /api/sessions/:id/directories - Delete directory
+router.delete('/sessions/:id/directories', async (req, res) => {
+  try {
+    const rawSession = sessionManager.getRawSession(req.params.id);
+    if (!rawSession) return res.status(404).json({ error: 'Session not found' });
+    if (!rawSession.conn || rawSession.status !== 'connected') {
+      return res.status(400).json({ error: 'Session not connected' });
+    }
+
+    const { remotePath } = req.body;
+    if (!remotePath) return res.status(400).json({ error: 'remotePath required' });
+
+    await sftpService.deleteDirectory(req.params.id, rawSession.conn, remotePath);
+    res.json({ message: 'Directory deleted', remotePath });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }

@@ -196,6 +196,7 @@ const App = {
   currentTreePath: '/',
   dirCache: {},
   expandedDirs: new Set(),
+  _selectedFile: null,
 
   init() {
     this.wsBaseUrl = this._getWsUrl();
@@ -547,7 +548,10 @@ const App = {
     // Close button
     tab.querySelector('.tab-close').addEventListener('click', (e) => {
       e.stopPropagation();
-      this._closeSession(session.id);
+      const name = `${session.username}@${session.hostname}:${session.port}`;
+      if (confirm(`Close session ${name}?`)) {
+        this._closeSession(session.id);
+      }
     });
 
     tabs.appendChild(tab);
@@ -758,8 +762,6 @@ const App = {
     menu.querySelectorAll('.context-item').forEach(item => {
       const action = item.dataset.action;
       item.style.display = '';
-      if (action === 'download' && type === 'directory') item.style.display = 'none';
-      if (action === 'rename' && type === 'directory') item.style.display = 'none';
     });
 
     menu.style.display = '';
@@ -776,9 +778,13 @@ const App = {
   },
 
   async _contextDownload() {
-    this._hideContextMenu();
     const target = this._contextTarget;
-    if (!target || target.type === 'directory') return;
+    this._hideContextMenu();
+    if (!target) return;
+    if (target.type === 'directory') {
+      this._loadFileList(target.path);
+      return;
+    }
 
     try {
       const res = await fetch(
@@ -801,8 +807,8 @@ const App = {
   },
 
   _contextUpload() {
-    this._hideContextMenu();
     const target = this._contextTarget;
+    this._hideContextMenu();
     const input = document.createElement('input');
     input.type = 'file';
     input.onchange = async (e) => {
@@ -837,8 +843,8 @@ const App = {
   },
 
   async _contextMkdir() {
-    this._hideContextMenu();
     const target = this._contextTarget;
+    this._hideContextMenu();
     const name = prompt('Folder name:');
     if (!name) return;
 
@@ -863,14 +869,17 @@ const App = {
   },
 
   async _contextDelete() {
-    this._hideContextMenu();
     const target = this._contextTarget;
+    this._hideContextMenu();
     if (!target) return;
 
     if (!confirm(`Delete "${target.path.split('/').pop()}"?`)) return;
 
+    const isDir = target.type === 'directory';
+    const endpoint = isDir ? '/directories' : '/files';
+
     try {
-      const res = await fetch(`${this.httpBaseUrl}/sessions/${this.activeSessionId}/files`, {
+      const res = await fetch(`${this.httpBaseUrl}/sessions/${this.activeSessionId}${endpoint}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ remotePath: target.path })
@@ -882,14 +891,17 @@ const App = {
       const parentPath = target.path.split('/').slice(0, -1).join('/') || '/';
       delete this.dirCache[parentPath];
       await this._renderFileTree();
+      if (isDir) {
+        this._loadFileList(parentPath);
+      }
     } catch (err) {
       alert('Delete failed: ' + err.message);
     }
   },
 
   async _contextRename() {
-    this._hideContextMenu();
     const target = this._contextTarget;
+    this._hideContextMenu();
     if (!target) return;
 
     const oldName = target.path.split('/').pop() || '';
@@ -1042,6 +1054,7 @@ const App = {
         });
       } else {
         item.addEventListener('click', () => {
+          this._selectedFile = file.filename;
           if (confirm(`Download ${file.filename}?`)) {
             this._downloadFile(file.filename);
           }
@@ -1082,13 +1095,12 @@ const App = {
     const remotePath = this.currentFilePath === '/'
       ? `/${filename}`
       : `${this.currentFilePath}/${filename}`;
-    const localPath = `${Date.now()}_${filename}`;
 
     try {
       const res = await fetch(`${this.httpBaseUrl}/sessions/${this.activeSessionId}/download`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ remotePath, localPath })
+        body: JSON.stringify({ remotePath })
       });
 
       if (!res.ok) {
@@ -1211,6 +1223,19 @@ const App = {
 
     const toolbar = document.querySelector('.file-toolbar');
     toolbar.insertBefore(uploadBtn, document.getElementById('current-path'));
+
+    // Download button
+    const downloadBtn = document.createElement('button');
+    downloadBtn.className = 'btn-small';
+    downloadBtn.textContent = 'Download';
+    downloadBtn.addEventListener('click', () => {
+      if (this._selectedFile) {
+        this._downloadFile(this._selectedFile);
+      } else {
+        alert('Click a file in the list first to select it for download.');
+      }
+    });
+    toolbar.insertBefore(downloadBtn, document.getElementById('current-path'));
   }
 };
 

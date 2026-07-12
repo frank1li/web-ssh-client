@@ -199,6 +199,55 @@ class SessionManager {
       }
     }
 
+    // Enable legacy SSH algorithms for older servers (e.g., Levinux/Dropbear)
+    // Set SSH_DISABLE_LEGACY_ALGORITHMS=true to disable and use strict modern defaults
+    if (process.env.SSH_DISABLE_LEGACY_ALGORITHMS !== 'true') {
+      config.algorithms = {
+        kex: [
+          'diffie-hellman-group1-sha1',
+          'diffie-hellman-group14-sha1',
+          'diffie-hellman-group-exchange-sha1',
+          'ecdh-sha2-nistp256',
+          'ecdh-sha2-nistp384',
+          'ecdh-sha2-nistp521',
+          'diffie-hellman-group-exchange-sha256',
+          'diffie-hellman-group14-sha256',
+          'diffie-hellman-group16-sha512',
+          'diffie-hellman-group18-sha512'
+        ],
+        cipher: [
+          'aes256-cbc',
+          'aes192-cbc',
+          'aes128-cbc',
+          '3des-cbc',
+          'aes256-gcm',
+          'aes128-gcm',
+          'aes256-ctr',
+          'aes192-ctr',
+          'aes128-ctr'
+        ],
+        hmac: [
+          'hmac-sha1',
+          'hmac-sha1-96',
+          'hmac-md5',
+          'hmac-md5-96',
+          'hmac-sha2-256',
+          'hmac-sha2-512',
+          'hmac-sha1-etm@openssh.com',
+          'hmac-sha2-256-etm@openssh.com',
+          'hmac-sha2-512-etm@openssh.com'
+        ],
+        serverHostKey: [
+          'ssh-rsa',
+          'ssh-dss',
+          'ecdsa-sha2-nistp256',
+          'ecdsa-sha2-nistp384',
+          'ecdsa-sha2-nistp521',
+          'ssh-ed25519'
+        ]
+      };
+    }
+
     return config;
   }
 

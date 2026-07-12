@@ -82,6 +82,46 @@ class SFTPService {
   }
 
   /**
+   * Upload a file from a buffer (e.g., from multer)
+   */
+  uploadFromBuffer(sessionId, conn, buffer, remotePath, onProgress) {
+    logger.sshInfo(sessionId, 'SFTP upload from buffer start', { remotePath, size: buffer.length });
+    return new Promise((resolve, reject) => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          logger.sshError(sessionId, 'SFTP upload init failed', { error: err.message });
+          return reject(err);
+        }
+
+        const writeStream = sftp.createWriteStream(remotePath);
+        const { Readable } = require('stream');
+        const readStream = Readable.from(buffer);
+        const totalBytes = buffer.length;
+        let writtenBytes = 0;
+
+        readStream.pipe(writeStream);
+
+        writeStream.on('error', (err) => {
+          logger.sshError(sessionId, 'SFTP upload write failed', { error: err.message, remotePath });
+          readStream.destroy();
+          reject(err);
+        });
+
+        writeStream.on('close', () => {
+          logger.sshInfo(sessionId, 'SFTP upload complete', { remotePath, bytes: totalBytes });
+          sftp.end();
+          resolve();
+        });
+
+        readStream.on('data', (chunk) => {
+          writtenBytes += chunk.length;
+          if (onProgress) onProgress(writtenBytes, totalBytes);
+        });
+      });
+    });
+  }
+
+  /**
    * Download a file from remote server
    */
   downloadFile(sessionId, conn, remotePath, localPath, onProgress) {
@@ -202,6 +242,30 @@ class SFTPService {
             return reject(err);
           }
           logger.sshInfo(sessionId, 'SFTP mkdir complete', { path: remotePath });
+          resolve();
+        });
+      });
+    });
+  }
+
+  /**
+   * Delete a remote directory (must be empty)
+   */
+  deleteDirectory(sessionId, conn, remotePath) {
+    logger.sshInfo(sessionId, 'SFTP rmdir', { path: remotePath });
+    return new Promise((resolve, reject) => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          logger.sshError(sessionId, 'SFTP rmdir init failed', { error: err.message });
+          return reject(err);
+        }
+        sftp.rmdir(remotePath, (err) => {
+          sftp.end();
+          if (err) {
+            logger.sshError(sessionId, 'SFTP rmdir failed', { error: err.message, path: remotePath });
+            return reject(err);
+          }
+          logger.sshInfo(sessionId, 'SFTP rmdir complete', { path: remotePath });
           resolve();
         });
       });
